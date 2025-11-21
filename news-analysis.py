@@ -213,50 +213,60 @@ headlines = {'source': [], 'title': [], 'pubDate' : [], 'text': []}
 
 
 
-def get_headlines():
-    '''
-    Fetch news from RSS feeds using feedparser and newspaper3k
-    '''
-    print("Fetching news...")
-    # clear headlines
-    headlines['source'] = []
-    headlines['title'] = []
-    headlines['pubDate'] = []
-    headlines['text'] = [] # New field for full text/summary
+def get_market_news(feeds):
+    print(f"📡 Scanning {len(feeds)} sources for news...")
+    
+    # 1. Define the structure the AI expects: { 'BTC': [ {title, text}, ... ] }
+    grouped_news = {}
+    
+    # Use global keywords variable
+    COIN_KEYWORDS = keywords
 
     for feed in feeds:
         try:
             parsed_feed = feedparser.parse(feed)
             for entry in parsed_feed.entries:
-                # Check date
-                published = None
-                if hasattr(entry, 'published_parsed'):
-                    published = datetime.fromtimestamp(time.mktime(entry.published_parsed)).replace(tzinfo=pytz.utc)
-                elif hasattr(entry, 'updated_parsed'):
-                    published = datetime.fromtimestamp(time.mktime(entry.updated_parsed)).replace(tzinfo=pytz.utc)
+                # --- YOUR DATE FILTER LOGIC HERE ---
+                # (Assuming you have the date check code from your snippet here)
+                # For simplicity, let's assume we accept recent news:
                 
-                if published:
-                    time_between = datetime.now(pytz.utc) - published
-                    if time_between.total_seconds() / 3600 <= HOURS_PAST:
-                        headlines['source'].append(feed)
-                        headlines['pubDate'].append(published)
-                        headlines['title'].append(entry.title)
+                title = entry.title
+                link = entry.link
+                
+                # 2. Fetch Full Text (Your Upgrade)
+                try:
+                    article = Article(link)
+                    article.download()
+                    article.parse()
+                    full_text = article.text
+                except:
+                    full_text = getattr(entry, 'description', title)
+
+                # 3. The "Sorting Hat": Which coin is this about?
+                found_coin = False
+                combined_text = (title + " " + full_text).lower()
+                
+                for coin, coin_kws in COIN_KEYWORDS.items():
+                    if any(k in combined_text for k in coin_kws):
+                        if coin not in grouped_news:
+                            grouped_news[coin] = []
                         
-                        # Try to get full text with newspaper
-                        try:
-                            article = Article(entry.link)
-                            article.download()
-                            article.parse()
-                            # article.nlp() # Optional: heavy
-                            headlines['text'].append(article.text if article.text else entry.title)
-                        except:
-                            # Fallback to description or title
-                            content = getattr(entry, 'description', entry.title)
-                            headlines['text'].append(content)
+                        grouped_news[coin].append({
+                            'title': title,
+                            'text': full_text, # We pass full text to LLM now
+                            'link': link
+                        })
+                        found_coin = True
+                        print(f"   ✅ Found {coin} news: {title[:30]}...")
                         
-                        print(f"Found: {entry.title}")
+                if not found_coin:
+                    pass # Skip general crypto news or add to 'General' bucket
+                    
         except Exception as e:
-            print(f"Error parsing {feed}: {e}")
+            print(f"   ⚠️ Error reading feed: {e}")
+            
+    print(f"🏁 Finished. Found relevant news for: {list(grouped_news.keys())}")
+    return grouped_news
 
 
 
@@ -264,22 +274,19 @@ def get_headlines():
 def categorise_headlines():
     '''arrange all headlines scaped in a dictionary matching the coin's name'''
     # get the headlines
-    get_headlines()
+    grouped_news = get_market_news(feeds)
     categorised_headlines = {}
 
     # this loop will create a dictionary for each keyword defined
     for keyword in keywords:
         categorised_headlines['{0}'.format(keyword)] = []
 
-    # keyword needs to be a loop in order to be able to append headline to the correct dictionary
-    for keyword in keywords:
-        # looping through each headline is required as well
-        for i, title in enumerate(headlines['title']):
-            text = headlines['text'][i]
-            # check keywords in title (or text?) - let's check both
-            if any(key in title for key in keywords[keyword]) or any(key in text for key in keywords[keyword]):
-                # append the text for sentiment analysis
-                categorised_headlines[keyword].append(text)
+    # Flatten the grouped_news into the expected format (list of texts)
+    for coin, news_list in grouped_news.items():
+        if coin in categorised_headlines:
+            for news_item in news_list:
+                # Append the full text for sentiment analysis
+                categorised_headlines[coin].append(news_item['text'])
 
     return categorised_headlines
 

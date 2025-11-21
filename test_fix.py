@@ -14,16 +14,14 @@ spec.loader.exec_module(news_analysis)
 def test_analyse_headlines():
     print("Testing analyse_headlines...")
     
-    # Mock headlines
-    news_analysis.headlines = {
-        'source': ['test_source'],
-        'title': ['Bitcoin hits all time high due to ETF approval'],
-        'pubDate': ['2023-01-01'],
-        'text': ['Bitcoin hits all time high due to ETF approval. This is very positive news for the crypto market.']
+    # Mock get_market_news to return our structured data
+    news_analysis.get_market_news = lambda feeds: {
+        'BTC': [{
+            'title': 'Bitcoin hits all time high due to ETF approval',
+            'text': 'Bitcoin hits all time high due to ETF approval. This is very positive news for the crypto market.',
+            'link': 'http://test.com'
+        }]
     }
-    
-    # Mock get_headlines to do nothing so it doesn't overwrite our mock data
-    news_analysis.get_headlines = lambda: None
     
     # Mock keywords to ensure we have a match
     news_analysis.keywords = {
