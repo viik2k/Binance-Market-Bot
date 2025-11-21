@@ -1,14 +1,6 @@
 
 # import for environment variables and waiting
 import os, time
-
-# used to parse XML feeds
-import xml.etree.ElementTree as ET
-
-# we use it to make async http requests
-import aiohttp
-
-# allows us to make our functions async
 import asyncio
 
 # date modules that we'll most likely need
@@ -20,22 +12,22 @@ import csv
 # used to save and load coins_in_hand dictionary
 import json
 
-# numpy for sums and means
-import numpy as np
 
-# nlp library to analyse sentiment
-import nltk
+# modern libraries
+import ccxt
+import feedparser
 import pytz
-from nltk.sentiment import SentimentIntensityAnalyzer
+import sys
+import lxml.html
+import lxml_html_clean
+lxml.html.clean = lxml_html_clean
 
-# needed for the binance API
-from binance.client import Client
-from binance.enums import *
-from binance.exceptions import BinanceAPIException, BinanceOrderException
+from newspaper import Article
 
-# used for binance websocket
-from binance.websockets import BinanceSocketManager
-from twisted.internet import reactor
+# Sentiment providers
+from transformers import pipeline
+import torch
+from openai import OpenAI
 
 # used for executing the code
 from itertools import count
@@ -55,13 +47,18 @@ api_secret_live = os.getenv('binance_secret_stalkbot_live')
 
 # Authenticate with the client
 if testnet:
-    client = Client(api_key_test, api_secret_test)
+    exchange = ccxt.binance({
+        'apiKey': api_key_test,
+        'secret': api_secret_test,
+        'enableRateLimit': True,
+    })
+    exchange.set_sandbox_mode(True)
 else:
-    client = Client(api_key_live, api_secret_live)
-
-# The API URL is manually changed in the library to work on the testnet
-if testnet:
-    client.API_URL = 'https://testnet.binance.vision/api'
+    exchange = ccxt.binance({
+        'apiKey': api_key_live,
+        'secret': api_secret_live,
+        'enableRateLimit': True,
+    })
 
 
 
@@ -111,7 +108,21 @@ REPEAT_EVERY = 60
 
 # define how old an article can be to be included
 # in hours
+# define how old an article can be to be included
+# in hours
 HOURS_PAST = 24
+
+# Sentiment Provider Configuration
+# Options: 'transformer', 'openai'
+SENTIMENT_PROVIDER = 'transformer' 
+
+# OpenAI Configuration (if using 'openai' provider)
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+OPENAI_MODEL = 'gpt-3.5-turbo'
+
+# Transformer Configuration (if using 'transformer' provider)
+# A good financial sentiment model
+TRANSFORMER_MODEL = "mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis"
 
 
 ############################################
@@ -142,79 +153,40 @@ for coin in keywords:
     if coin not in coins_in_hand:
         coins_in_hand[coin] = 0
 
-# current price of CRYPTO pulled through the websocket
-CURRENT_PRICE = {}
 
-
-def ticker_socket(msg):
-    '''Open a stream for financial information for CRYPTO'''
-    if msg['e'] != 'error':
-        global CURRENT_PRICE
-        CURRENT_PRICE['{0}'.format(msg['s'])] = msg['c']
-    else:
-        print('error')
-
-
-# connect to the websocket client and start the socket
-bsm = BinanceSocketManager(client)
-for coin in keywords:
-    conn_key = bsm.start_symbol_ticker_socket(coin+PAIRING, ticker_socket)
-bsm.start()
-
-
-'''For the amount of CRYPTO to trade in USDT'''
-lot_size = {}
-
-'''Find step size for each coin
-For example, BTC supports a volume accuracy of
-0.000001, while XRP only 0.1
-'''
-for coin in keywords:
-
+def get_price(symbol):
+    '''Get the current price for a symbol'''
     try:
-        info = client.get_symbol_info(coin+PAIRING)
-        step_size = info['filters'][2]['stepSize']
-        lot_size[coin+PAIRING] = step_size.index('1') - 1
-
-        if lot_size[coin+PAIRING]<0:
-            lot_size[coin+PAIRING]=0
-
-    except:
-        pass
-for coin in keywords:
-    try:
-        info = client.get_symbol_info(coin)
-        step_size = info['filters'][2]['stepSize']
-        lot_size[coin] = step_size.index('1') - 1
-
-        if lot_size[coin]<0:
-            lot_size[coin]=0
-
-    except:
-        pass
+        ticker = exchange.fetch_ticker(symbol)
+        return ticker['last']
+    except Exception as e:
+        print(f"Error fetching price for {symbol}: {e}")
+        return None
 
 
 
-def calculate_one_volume_from_lot_size(coin, amount):
-    if coin not in lot_size:
-        return float('{:.1f}'.format(amount))
+# Load markets to get precision info
+exchange.load_markets()
 
-    else:
-        return float('{:.{}f}'.format(amount, lot_size[coin]))
+def get_lot_size(symbol):
+    if symbol in exchange.markets:
+        return exchange.markets[symbol]['precision']['amount']
+    return None
+
+
 
 
 def calculate_volume():
-    while CURRENT_PRICE == {}:
-        print('Connecting to the socket...')
-        time.sleep(3)
-
-    else:
-        volume = {}
-        for coin in CURRENT_PRICE:
-            volume[coin] = float(QUANTITY / float(CURRENT_PRICE[coin]))
-            volume[coin] = calculate_one_volume_from_lot_size(coin, volume[coin])
-
-        return volume
+    volume = {}
+    for coin in keywords:
+        symbol = coin + PAIRING
+        price = get_price(symbol)
+        if price:
+            # Calculate amount to buy: QUANTITY (in USDT) / Price
+            amount = QUANTITY / float(price)
+            # Adjust to precision
+            volume[symbol] = exchange.amount_to_precision(symbol, amount)
+    return volume
 
 
 # load the csv file containg top 100 crypto feeds
@@ -235,79 +207,64 @@ with open('Crypto feeds.csv') as csv_file:
     for row in csv_reader:
         feeds.append(row[0])
 
-
 # Make headlines global variable as it should be the same across all functions
-headlines = {'source': [], 'title': [], 'pubDate' : [] }
+headlines = {'source': [], 'title': [], 'pubDate' : [], 'text': []}
 
 
-async def get_feed_data(session, feed, headers):
+
+
+def get_headlines():
     '''
-    Get relevent data from rss feed, in async fashion
-    :param feed: The name of the feed we want to fetch
-    :param headers: The header we want on the request
-    :param timeout: The default timout before we give up and move on
-    :return: None, we don't need to return anything we append it all on the headlines dict
+    Fetch news from RSS feeds using feedparser and newspaper3k
     '''
-    try:
-        async with session.get(feed, headers=headers, timeout=60) as response:
-            # define the root for our parsing
-            text = await response.text()
-            root = ET.fromstring(text)
+    print("Fetching news...")
+    # clear headlines
+    headlines['source'] = []
+    headlines['title'] = []
+    headlines['pubDate'] = []
+    headlines['text'] = [] # New field for full text/summary
 
-            channel = root.find('channel/item/title').text
-            pubDate = root.find('channel/item/pubDate').text
-            # some jank to ensure no alien characters are being passed
-            title = channel.encode('UTF-8').decode('UTF-8')
+    for feed in feeds:
+        try:
+            parsed_feed = feedparser.parse(feed)
+            for entry in parsed_feed.entries:
+                # Check date
+                published = None
+                if hasattr(entry, 'published_parsed'):
+                    published = datetime.fromtimestamp(time.mktime(entry.published_parsed)).replace(tzinfo=pytz.utc)
+                elif hasattr(entry, 'updated_parsed'):
+                    published = datetime.fromtimestamp(time.mktime(entry.updated_parsed)).replace(tzinfo=pytz.utc)
+                
+                if published:
+                    time_between = datetime.now(pytz.utc) - published
+                    if time_between.total_seconds() / 3600 <= HOURS_PAST:
+                        headlines['source'].append(feed)
+                        headlines['pubDate'].append(published)
+                        headlines['title'].append(entry.title)
+                        
+                        # Try to get full text with newspaper
+                        try:
+                            article = Article(entry.link)
+                            article.download()
+                            article.parse()
+                            # article.nlp() # Optional: heavy
+                            headlines['text'].append(article.text if article.text else entry.title)
+                        except:
+                            # Fallback to description or title
+                            content = getattr(entry, 'description', entry.title)
+                            headlines['text'].append(content)
+                        
+                        print(f"Found: {entry.title}")
+        except Exception as e:
+            print(f"Error parsing {feed}: {e}")
 
-            # convert pubDat to datetime
-            published = datetime.strptime(pubDate.replace("GMT", "+0000"), '%a, %d %b %Y %H:%M:%S %z')
-            # calculate timedelta
-            time_between = datetime.now(pytz.utc) - published
 
-            #print(f'Czas: {time_between.total_seconds() / (60 * 60)}')
-
-            if time_between.total_seconds() / (60 * 60) <= HOURS_PAST:
-                # append the source
-                headlines['source'].append(feed)
-                # append the publication date
-                headlines['pubDate'].append(pubDate)
-                # append the title
-                headlines['title'].append(title)
-                print(channel)
-
-    except Exception as e:
-        # Catch any error and also print it
-        print(f'Could not parse {feed} error is: {e}')
-
-
-async def get_headlines():
-    '''
-    Creates a an async task for each of our feeds which are appended to headlines
-    :return: None
-    '''
-    # add headers to the request for ElementTree. Parsing issues occur without headers
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:87.0) Gecko/20100101 Firefox/87.0'
-    }
-
-    # A nifty timer to see how long it takes to parse all the feeds
-    start = timer()
-    async with aiohttp.ClientSession() as session:
-        tasks = []
-        for feed in feeds:
-            task = asyncio.ensure_future(get_feed_data(session, feed, headers))
-            tasks.append(task)
-
-        # This makes sure we finish all tasks/requests before we continue executing our code
-        await asyncio.gather(*tasks)
-    end = timer()
-    print("Time it took to parse feeds: ", end - start)
 
 
 def categorise_headlines():
     '''arrange all headlines scaped in a dictionary matching the coin's name'''
     # get the headlines
-    asyncio.run(get_headlines())
+    get_headlines()
     categorised_headlines = {}
 
     # this loop will create a dictionary for each keyword defined
@@ -316,30 +273,84 @@ def categorise_headlines():
 
     # keyword needs to be a loop in order to be able to append headline to the correct dictionary
     for keyword in keywords:
-
         # looping through each headline is required as well
-        for headline in headlines['title']:
-            # appends the headline containing the keyword to the correct dictionary
-            if any(key in headline for key in keywords[keyword]):
-                categorised_headlines[keyword].append(headline)
+        for i, title in enumerate(headlines['title']):
+            text = headlines['text'][i]
+            # check keywords in title (or text?) - let's check both
+            if any(key in title for key in keywords[keyword]) or any(key in text for key in keywords[keyword]):
+                # append the text for sentiment analysis
+                categorised_headlines[keyword].append(text)
 
     return categorised_headlines
 
 
+
+def analyze_transformer(text):
+    '''Analyze sentiment using HuggingFace transformers'''
+    try:
+        # Initialize pipeline (lazy load could be better but for simplicity here)
+        # Note: This might be slow to load on first run
+        classifier = pipeline('sentiment-analysis', model=TRANSFORMER_MODEL)
+        result = classifier(text[:512])[0] # Truncate to 512 tokens
+        
+        # Map labels to compound score
+        # Model specific: usually 'positive', 'negative', 'neutral'
+        label = result['label'].lower()
+        score = result['score']
+        
+        if 'negative' in label:
+            return -score
+        elif 'positive' in label:
+            return score
+        else:
+            return 0.0
+    except Exception as e:
+        print(f"Transformer error: {e}")
+        return 0.0
+
+def analyze_openai(text):
+    '''Analyze sentiment using OpenAI'''
+    try:
+        if not OPENAI_API_KEY:
+            print("OpenAI API Key not set!")
+            return 0.0
+            
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a financial sentiment analyzer. Analyze the following news headline/text and return a single float number between -1.0 (extremely negative) and 1.0 (extremely positive). Return ONLY the number."},
+                {"role": "user", "content": text}
+            ]
+        )
+        content = response.choices[0].message.content.strip()
+        return float(content)
+    except Exception as e:
+        print(f"OpenAI error: {e}")
+        return 0.0
+
 def analyse_headlines():
     '''Analyse categorised headlines and return NLP scores'''
-    sia = SentimentIntensityAnalyzer()
     categorised_headlines = categorise_headlines()
-
     sentiment = {}
-
+    
     for coin in categorised_headlines:
         if len(categorised_headlines[coin]) > 0:
             # create dict for each coin
             sentiment['{0}'.format(coin)] = []
             # append sentiment to dict
-            for title in categorised_headlines[coin]:
-                sentiment[coin].append(sia.polarity_scores(title))
+            for text in categorised_headlines[coin]:
+                score = 0.0
+                if SENTIMENT_PROVIDER == 'transformer':
+                    score = analyze_transformer(text)
+                elif SENTIMENT_PROVIDER == 'openai':
+                    score = analyze_openai(text)
+                
+                # For consistency with old structure which expected a dict with 'compound'
+                # We will just store the float score directly in our new list, 
+                # BUT compile_sentiment expects a list of dicts or we need to change compile_sentiment.
+                # Let's just return a list of dicts to be safe and minimize refactor of compile_sentiment
+                sentiment[coin].append({'compound': score})
 
     return sentiment
 
@@ -381,52 +392,49 @@ def compound_average():
 
 
 
+
 def buy(compiled_sentiment, headlines_analysed):
     '''Check if the sentiment is positive and keyword is found for each handle'''
     volume = calculate_volume()
     for coin in compiled_sentiment:
-
-
         # check if the sentiment and number of articles are over the given threshold
         if compiled_sentiment[coin] > SENTIMENT_THRESHOLD and headlines_analysed[coin] >= MINUMUM_ARTICLES and coins_in_hand[coin]==0:
             # check the volume looks correct
-            print(f'preparing to buy {volume[coin+PAIRING]} {coin} with {PAIRING} at {CURRENT_PRICE[coin+PAIRING]}')
+            price = get_price(coin+PAIRING)
+            print(f'preparing to buy {volume[coin+PAIRING]} {coin} with {PAIRING} at {price}')
 
             if (testnet):
                 # create test order before pushing an actual order
-                test_order = client.create_test_order(symbol=coin+PAIRING, side='BUY', type='MARKET', quantity=volume[coin+PAIRING])
+                pass 
 
-            # try to create a real order if the test orders did not raise an exception
+            # try to create a real order
             try:
-                buy_limit = client.create_order(
+                buy_limit = exchange.create_order(
                     symbol=coin+PAIRING,
-                    side='BUY',
-                    type='MARKET',
-                    quantity=volume[coin+PAIRING]
+                    side='buy',
+                    type='market',
+                    amount=volume[coin+PAIRING]
                 )
-
-            #error handling here in case position cannot be placed
             except Exception as e:
                 print(e)
-
-            # run the else block if the position has been placed and return some info
             else:
                 # adds coin to our portfolio
                 coins_in_hand[coin] += volume[coin+PAIRING]
 
                 # retrieve the last order
-                order = client.get_all_orders(symbol=coin+PAIRING, limit=1)
+                # For simplicity, use the returned buy_limit order object
+                order = [buy_limit]
 
                 if order:
                     # convert order timsestamp into UTC format
-                    time = order[0]['time'] / 1000
-                    utc_time = datetime.fromtimestamp(time)
+                    time_ts = order[0]['timestamp'] / 1000
+                    utc_time = datetime.fromtimestamp(time_ts)
 
                     # grab the price of CRYPTO the order was placed at for reporting
-                    bought_at = CURRENT_PRICE[coin+PAIRING]
+                    bought_at = get_price(coin+PAIRING)
 
                     # print order condirmation to the console
-                    print(f"order {order[0]['orderId']} has been placed on {coin} with {order[0]['origQty']} at {utc_time} and bought at {bought_at}")
+                    print(f"order {order[0]['id']} has been placed on {coin} with {order[0]['amount']} at {utc_time} and bought at {bought_at}")
                 else:
                     print('Could not get last order from Binance!')
 
@@ -434,54 +442,48 @@ def buy(compiled_sentiment, headlines_analysed):
             print(f'Sentiment not positive enough for {coin}, or not enough headlines analysed or already bought: {compiled_sentiment[coin]}, {headlines_analysed[coin]}')
 
 
-
-
 def sell(compiled_sentiment, headlines_analysed):
     '''Check if the sentiment is negative and keyword is found for each handle'''
     for coin in compiled_sentiment:
-
         # check if the sentiment and number of articles are over the given threshold
         if compiled_sentiment[coin] < NEGATIVE_SENTIMENT_THRESHOLD and headlines_analysed[coin] >= MINUMUM_ARTICLES and coins_in_hand[coin]>0:
-
             # check the volume looks correct
-            print(f'preparing to sell {coins_in_hand[coin]} {coin} at {CURRENT_PRICE[coin+PAIRING]}')
+            price = get_price(coin+PAIRING)
+            print(f'preparing to sell {coins_in_hand[coin]} {coin} at {price}')
 
-            amount_to_sell = calculate_one_volume_from_lot_size(coin+PAIRING, coins_in_hand[coin]*99.5/100)
+            # amount_to_sell = calculate_one_volume_from_lot_size(coin+PAIRING, coins_in_hand[coin]*99.5/100)
+            # Simplify amount calculation using ccxt precision
+            amount_to_sell = exchange.amount_to_precision(coin+PAIRING, coins_in_hand[coin]*0.995)
 
             if (testnet):
-                # create test order before pushing an actual order
-                test_order = client.create_test_order(symbol=coin+PAIRING, side='SELL', type='MARKET', quantity=amount_to_sell)
+                pass
 
-            # try to create a real order if the test orders did not raise an exception
+            # try to create a real order
             try:
-                buy_limit = client.create_order(
+                sell_limit = exchange.create_order(
                     symbol=coin+PAIRING,
-                    side='SELL',
-                    type='MARKET',
-                    quantity=amount_to_sell
+                    side='sell',
+                    type='market',
+                    amount=amount_to_sell
                 )
-
-            #error handling here in case position cannot be placed
             except Exception as e:
                 print(e)
-
-            # run the else block if the position has been placed and return some info
             else:
                 # set coin to 0
                 coins_in_hand[coin]=0
                 # retrieve the last order
-                order = client.get_all_orders(symbol=coin+PAIRING, limit=1)
+                order = [sell_limit]
 
                 if order:
                     # convert order timsestamp into UTC format
-                    time = order[0]['time'] / 1000
-                    utc_time = datetime.fromtimestamp(time)
+                    time_ts = order[0]['timestamp'] / 1000
+                    utc_time = datetime.fromtimestamp(time_ts)
 
                     # grab the price of CRYPTO the order was placed at for reporting
-                    sold_at = CURRENT_PRICE[coin+PAIRING]
+                    sold_at = get_price(coin+PAIRING)
 
                     # print order condirmation to the console
-                    print(f"order {order[0]['orderId']} has been placed on {coin} with {order[0]['origQty']} coins sold for {sold_at} each at {utc_time}")
+                    print(f"order {order[0]['id']} has been placed on {coin} with {order[0]['amount']} coins sold for {sold_at} each at {utc_time}")
                 else:
                     print('Could not get last order from Binance!')
 
